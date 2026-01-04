@@ -449,6 +449,47 @@
             font-size: 18px;
         }
 
+        /* Update Toast Notification */
+        #updateToast {
+            position: fixed;
+            bottom: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: linear-gradient(135deg, #4caf50, #45a049);
+            color: white;
+            padding: 16px 24px;
+            border-radius: 30px;
+            box-shadow: 0 6px 20px rgba(76, 175, 80, 0.5);
+            display: none;
+            align-items: center;
+            gap: 12px;
+            z-index: 2001;
+            font-size: 15px;
+            font-weight: 500;
+            animation: slideUpToast 0.3s ease;
+        }
+
+        #updateToast.show {
+            display: flex;
+        }
+
+        @keyframes slideUpToast {
+            from {
+                transform: translateX(-50%) translateY(100px);
+                opacity: 0;
+            }
+
+            to {
+                transform: translateX(-50%) translateY(0);
+                opacity: 1;
+            }
+        }
+
+        #updateToast::before {
+            content: "🔄";
+            font-size: 20px;
+        }
+
         /* PWA Install Modal */
         #installModal {
             position: fixed;
@@ -1318,14 +1359,62 @@
                 installModal.classList.remove('show');
             });
 
-            // Register Service Worker
+            // Enhanced Service Worker Registration with Auto-Update
             if ('serviceWorker' in navigator) {
                 try {
-                    await navigator.serviceWorker.register('./sw.js');
+                    const registration = await navigator.serviceWorker.register('./sw.js');
                     console.log('Service Worker registered');
+
+                    // Check for updates every 60 seconds when page is active
+                    setInterval(() => {
+                        if (document.visibilityState === 'visible') {
+                            registration.update();
+                        }
+                    }, 60000);
+
+                    // Listen for new service worker waiting
+                    registration.addEventListener('updatefound', () => {
+                        const newWorker = registration.installing;
+
+                        newWorker.addEventListener('statechange', () => {
+                            if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                                // New service worker available, activate silently
+                                if (navigator.serviceWorker.controller) {
+                                    navigator.serviceWorker.controller.postMessage({ type: 'SKIP_WAITING' });
+                                }
+                            }
+                        });
+                    });
+
+                    // Listen for controller change (new SW activated)
+                    navigator.serviceWorker.addEventListener('controllerchange', () => {
+                        console.log('New service worker activated, reloading page...');
+                        // Reload page to get new content
+                        window.location.reload();
+                    });
+
                 } catch (error) {
                     console.error('Service Worker registration failed:', error);
                 }
+            }
+
+            // Show update notification toast
+            function showUpdateToast() {
+                const toast = document.createElement('div');
+                toast.id = 'updateToast';
+                toast.className = 'show';
+                toast.innerHTML = 'New version available! Updating...';
+                document.body.appendChild(toast);
+
+                // Tell the waiting service worker to activate
+                if (navigator.serviceWorker.controller) {
+                    navigator.serviceWorker.controller.postMessage({ type: 'SKIP_WAITING' });
+                }
+
+                // Remove toast after reload
+                setTimeout(() => {
+                    toast.classList.remove('show');
+                }, 3000);
             }
 
             // Event Listeners

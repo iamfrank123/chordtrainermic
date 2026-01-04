@@ -1,7 +1,10 @@
 // Service Worker for Interactive Jazz Chord Trainer
-// Enables offline functionality and faster load times
+// Auto-update system - updates automatically on new deployments
 
-const CACHE_NAME = 'chord-trainer-v1';
+// IMPORTANT: Change this version number with each deployment to force update
+const VERSION = '1.0.5'; // INCREMENT THIS ON EACH DEPLOY
+const CACHE_NAME = `chord-trainer-v${VERSION}`;
+
 const urlsToCache = [
   './',
   './index.html',
@@ -14,33 +17,32 @@ const urlsToCache = [
   './icon-192.png',
   './icon-384.png',
   './icon-512.png',
-  'https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js',
-  'https://tonejs.github.io/audio/salamander/C4.mp3',
-  'https://tonejs.github.io/audio/salamander/Ds4.mp3',
-  'https://tonejs.github.io/audio/salamander/Fs4.mp3',
-  'https://tonejs.github.io/audio/salamander/A4.mp3'
+  'https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js'
 ];
 
 // Install event - cache static assets
 self.addEventListener('install', event => {
-  console.log('[Service Worker] Installing...');
+  console.log(`[Service Worker v${VERSION}] Installing...`);
   event.waitUntil(
     caches.open(CACHE_NAME)
       .then(cache => {
         console.log('[Service Worker] Caching app shell');
         return cache.addAll(urlsToCache);
       })
+      .then(() => {
+        console.log(`[Service Worker v${VERSION}] Installed successfully`);
+        // Force the waiting service worker to become the active service worker immediately
+        return self.skipWaiting();
+      })
       .catch(err => {
         console.error('[Service Worker] Cache failed:', err);
       })
   );
-  // Force the waiting service worker to become the active service worker
-  self.skipWaiting();
 });
 
-// Activate event - clean up old caches
+// Activate event - clean up old caches and take control immediately
 self.addEventListener('activate', event => {
-  console.log('[Service Worker] Activating...');
+  console.log(`[Service Worker v${VERSION}] Activating...`);
   event.waitUntil(
     caches.keys().then(cacheNames => {
       return Promise.all(
@@ -51,55 +53,72 @@ self.addEventListener('activate', event => {
           }
         })
       );
+    }).then(() => {
+      console.log(`[Service Worker v${VERSION}] Activated and claiming clients`);
+      // Take control of all pages immediately
+      return self.clients.claim();
     })
   );
-  // Claim all clients immediately
-  return self.clients.claim();
 });
 
-// Fetch event - serve from cache, fallback to network
+// Fetch event - Network First strategy for HTML, Cache First for static assets
 self.addEventListener('fetch', event => {
+  const url = new URL(event.request.url);
+  
+  // Network First for HTML files (always get latest)
+  if (event.request.headers.get('accept').includes('text/html') || url.pathname.endsWith('.html')) {
+    event.respondWith(
+      fetch(event.request)
+        .then(response => {
+          // Clone and cache the new version
+          const responseToCache = response.clone();
+          caches.open(CACHE_NAME).then(cache => {
+            cache.put(event.request, responseToCache);
+          });
+          return response;
+        })
+        .catch(() => {
+          // If network fails, serve from cache
+          return caches.match(event.request);
+        })
+    );
+    return;
+  }
+  
+  // Cache First for other assets (CSS, JS, images)
   event.respondWith(
     caches.match(event.request)
       .then(response => {
-        // Cache hit - return response
         if (response) {
-          console.log('[Service Worker] Serving from cache:', event.request.url);
           return response;
         }
 
-        // Clone the request
-        const fetchRequest = event.request.clone();
-
-        // Network request
-        return fetch(fetchRequest).then(response => {
-          // Check if valid response
+        return fetch(event.request).then(response => {
+          // Don't cache non-successful responses
           if (!response || response.status !== 200 || response.type !== 'basic') {
             return response;
           }
 
-          // Clone the response
           const responseToCache = response.clone();
-
-          // Cache the new resource
-          caches.open(CACHE_NAME)
-            .then(cache => {
-              cache.put(event.request, responseToCache);
-            });
+          caches.open(CACHE_NAME).then(cache => {
+            cache.put(event.request, responseToCache);
+          });
 
           return response;
-        }).catch(error => {
-          console.error('[Service Worker] Fetch failed:', error);
-          // You could return a custom offline page here
-          throw error;
         });
       })
   );
 });
 
-// Listen for messages from the app
+// Listen for skip waiting message from client
 self.addEventListener('message', event => {
   if (event.data && event.data.type === 'SKIP_WAITING') {
+    console.log('[Service Worker] Received SKIP_WAITING message');
     self.skipWaiting();
   }
+});
+
+// Notify clients when a new version is available
+self.addEventListener('controllerchange', () => {
+  console.log('[Service Worker] Controller changed - new version active');
 });
