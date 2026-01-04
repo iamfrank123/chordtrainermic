@@ -1062,6 +1062,7 @@
         <div id="micStatus" style="font-size: 0.8em; margin-top: 2px;"></div>
     </div>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <script src="https://unpkg.com/meyda/dist/web/meyda.min.js"></script>
     <script>
         let midiAccess, currentChord, activeNotes = new Set(), running = false;
         let chordCounter = 0, newChordTimeout, correctChordLocked = false;
@@ -1476,6 +1477,7 @@
         function updateEnabledChordsReminder() { const enabledChords = Array.from(document.querySelectorAll('.chordType:checked')).map(cb => cb.value).join(', '); document.getElementById('enabledChordsReminder').textContent = `${t('enabledTypes')}: ${enabledChords}`; }
 
         // Microphone Functions
+        // Microphone Functions with Meyda and Chroma Template Matching
         async function startMicrophone() {
             if (midiAccess && midiAccess.inputs.size > 0) {
                 alert(t('micMidiConflict'));
@@ -1484,19 +1486,42 @@
             if (micRunning) return;
 
             try {
+                if (!micContext) {
+                    micContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                if (micContext.state === 'suspended') {
+                    await micContext.resume();
+                }
+
                 micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                micContext = new (window.AudioContext || window.webkitAudioContext)();
-                analyser = micContext.createAnalyser();
-                analyser.fftSize = 2048; // Good balance for pitch detection
                 micSource = micContext.createMediaStreamSource(micStream);
-                micSource.connect(analyser);
+
+                // Initialize Meyda
+                if (typeof Meyda === 'undefined') {
+                    const script = document.createElement('script');
+                    script.src = "https://unpkg.com/meyda/dist/web/meyda.min.js";
+                    script.onload = () => { startMicrophone(); }; // Retry after load
+                    document.head.appendChild(script);
+                    return;
+                }
+
+                analyser = Meyda.createMeydaAnalyzer({
+                    "audioContext": micContext,
+                    "source": micSource,
+                    "bufferSize": 4096, // Larger buffer for better frequency resolution
+                    "featureExtractors": ["chroma", "rms"],
+                    "callback": (features) => {
+                        analyzeAudio(features);
+                    }
+                });
+
+                analyser.start();
                 micRunning = true;
 
                 document.getElementById('micToggleBtn').textContent = t('micDisable');
                 document.getElementById('micStatus').textContent = t('micActive');
                 document.getElementById('micStatus').style.color = '#4caf50';
 
-                detectPitch();
             } catch (err) {
                 console.error("Mic Error:", err);
                 document.getElementById('micStatus').textContent = t('micError');
@@ -1507,9 +1532,9 @@
         function stopMicrophone() {
             if (!micRunning) return;
             micRunning = false;
-            if (pitchDetectionFrame) cancelAnimationFrame(pitchDetectionFrame);
+
+            if (analyser) analyser.stop();
             if (micStream) micStream.getTracks().forEach(track => track.stop());
-            if (micContext) micContext.close();
 
             document.getElementById('micToggleBtn').textContent = t('micEnable');
             document.getElementById('micStatus').textContent = "";
@@ -1520,102 +1545,67 @@
             else startMicrophone();
         }
 
+        function analyzeAudio(features) {
+            if (!features || !features.chroma || !currentChord || correctChordLocked) return;
+
+            // RMS check to ignore silence
+            if (features.rms < 0.005) {
+                return;
+            }
+
+            const inputChroma = features.chroma;
+
+            // Build Target Chroma Template
+            // Chroma is 12 bins: C, C#, D, D#, E, F, F#, G, G#, A, A#, B
+            const targetChroma = new Array(12).fill(0);
+            const essentialNotes = currentChord.essential; // [0, 4, 7] etc. corresponding to pitch classes
+
+            // Weight essential notes in template
+            essentialNotes.forEach(noteIndex => {
+                targetChroma[noteIndex % 12] = 1;
+            });
+
+            // Calculate Cosine Similarity
+            const similarity = calculateCosineSimilarity(inputChroma, targetChroma);
+
+            // Debug info
+            // console.log("Sim:", similarity.toFixed(2), "RMS:", features.rms.toFixed(4));
+
+            // Strict Threshold for correctness
+            // 0.85 is a good baseline for cosine similarity
+            if (similarity > 0.85) {
+                correctChordLocked = true;
+                triggerSuccess();
+            }
+        }
+
+        function calculateCosineSimilarity(vecA, vecB) {
+            let dotProduct = 0;
+            let normA = 0;
+            let normB = 0;
+            for (let i = 0; i < vecA.length; i++) {
+                dotProduct += vecA[i] * vecB[i];
+                normA += vecA[i] * vecA[i];
+                normB += vecB[i] * vecB[i];
+            }
+            if (normA === 0 || normB === 0) return 0;
+            return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+        }
+
+        function triggerSuccess() {
+            document.getElementById('status').textContent = t('correct');
+            document.getElementById('status').className = 'status-correct';
+            if (document.getElementById('audioToggle').checked) {
+                const ding = new Tone.Oscillator("C6").toDestination().start().stop("+0.1");
+            }
+            if (document.getElementById('automaticAdvanceToggle').checked) {
+                clearTimeout(newChordTimeout);
+                newChordTimeout = setTimeout(() => { nextChord(); }, 1000);
+            }
+        }
+
         function detectPitch() {
-            if (!micRunning) return;
-
-            const bufferLength = analyser.frequencyBinCount;
-            const dataArray = new Float32Array(bufferLength);
-            analyser.getFloatFrequencyData(dataArray);
-
-            // Simple peak detection
-            let maxVal = -Infinity;
-            let maxIndex = -1;
-
-            // Focus on range ~60Hz (C2) to ~2000Hz (C7)
-            // sampleRate usually 44100 or 48000. 
-            // binWidth = sampleRate / fftSize. e.g. 48000 / 2048 ~= 23.4Hz
-            const sampleRate = micContext.sampleRate;
-
-            // We want to detect which pitch classes (0-11) are present with significant energy
-            // Instead of just finding one max peak, let's accumulate energy per pitch class
-            const pitchClassEnergy = new Float32Array(12).fill(0);
-
-            for (let i = 0; i < bufferLength; i++) {
-                const amplitude = dataArray[i];
-                if (amplitude < -70) continue; // Noise gate
-
-                const frequency = i * sampleRate / analyser.fftSize;
-                if (frequency < 60 || frequency > 3000) continue; // Filter relevant range
-
-                // Convert freq to MIDI note
-                // MIDI note number = 69 + 12 * log2(f / 440)
-                const midiNote = 69 + 12 * Math.log2(frequency / 440);
-                const roundedNote = Math.round(midiNote);
-
-                // If the frequency is close enough to the center of the note bin
-                if (Math.abs(midiNote - roundedNote) < 0.3) {
-                    // Add energy (db is log, converted roughly to linear weight)
-                    // amplitude is dBFS, usually negative. -10 is loud, -100 silent.
-                    // weight: shift up so -70 is 0. 
-                    const weight = Math.pow(10, (amplitude + 70) / 20);
-                    pitchClassEnergy[roundedNote % 12] += weight;
-                }
-            }
-
-            // Threshold detection
-            const activePitchClasses = new Set();
-            // Find max energy to normalize? Or just arbitrary threshold
-            // Actually, we want to update 'activeNotes' for checkChord()
-            // checkChord expects MIDI numbers. But it converts to % 12. 
-            // So we can send simply 0-11, corresponding to C-B.
-
-            let maxEnergy = 0;
-            for (let e of pitchClassEnergy) if (e > maxEnergy) maxEnergy = e;
-
-            if (maxEnergy > 0.5) { // Arbitrary threshold check
-                for (let i = 0; i < 12; i++) {
-                    // If energy is significant relative to max (e.g., 20% of max peak)
-                    if (pitchClassEnergy[i] > maxEnergy * 0.2) {
-                        // Use octave 4 for compatibility (e.g. 60 + i)
-                        // But checkChord does % 12, so just 'i' works if activeNotes stores midi numbers?
-                        // activeNotes stores MIDI note numbers (integers). n % 12 works on small ints too.
-                        activePitchClasses.add(i);
-                    }
-                }
-            }
-
-            // Update activeNotes if we found something
-            // Since we can't detect 'note off' easily, we might want to clear activeNotes if silence
-            // Or just constantly rewrite activeNotes from mic input
-
-            // IMPORTANT: If we are in MIC mode, we override activeNotes
-            // We should use a separate set or flag, but since we are replacing input, let's clear and fill.
-            // But we need to be careful not to flicker. 
-            // Let's only update if we have some detection.
-
-            // Decay Logic? 
-            // For this simple implementation, let's just set activeNotes to what we hear now.
-            // To prevent flickering causing 'wrong note' failures, maybe we smooth it?
-
-            // For now: Direct mapping
-            if (activePitchClasses.size > 0) {
-                // Clear previous only if we have new input? 
-                // If we stop playing, we want it to clear?
-                activeNotes.clear();
-                activePitchClasses.forEach(n => activeNotes.add(n));
-                checkChord();
-            } else {
-                // If silence, determine if we should clear. 
-                // If user stops playing, activeNotes should clear? 
-                // But checkChord checks constantly? No, checkChord is called on changes.
-                if (activeNotes.size > 0) {
-                    activeNotes.clear();
-                    // Don't call checkStatus if empty? Or do?
-                    document.getElementById('status').textContent = '';
-                }
-            }
-
-            pitchDetectionFrame = requestAnimationFrame(detectPitch);
+            // Deprecated by Meyda
         }
 
         // Wrapper to inject logic into existing function
