@@ -1076,6 +1076,8 @@
 
         // Microphone variables
         let micContext, analyser, micStream, micRunning = false;
+        let previousChroma = new Float32Array(12).fill(0);
+        let smoothingAlpha = 0.65;
         let micSource;
         let pitchDetectionFrame;
         const noteStrings = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -1496,6 +1498,13 @@
                 micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
                 micSource = micContext.createMediaStreamSource(micStream);
 
+                // Pre-processing: LowShelf Filter
+                const lowShelf = micContext.createBiquadFilter();
+                lowShelf.type = "lowshelf";
+                lowShelf.frequency.value = 250;
+                lowShelf.gain.value = 12;
+                micSource.connect(lowShelf);
+
                 // Initialize Meyda
                 if (typeof Meyda === 'undefined') {
                     const script = document.createElement('script');
@@ -1507,14 +1516,16 @@
 
                 analyser = Meyda.createMeydaAnalyzer({
                     "audioContext": micContext,
-                    "source": micSource,
-                    "bufferSize": 4096, // Larger buffer for better frequency resolution
-                    "featureExtractors": ["chroma", "rms"],
+                    "source": lowShelf,
+                    "bufferSize": 8192, // Max resolution (~5Hz bin width)
+                    "featureExtractors": ["chroma", "rms", "spectralCentroid"],
                     "callback": (features) => {
                         analyzeAudio(features);
                     }
                 });
 
+                // Reset smoothing
+                previousChroma.fill(0);
                 analyser.start();
                 micRunning = true;
 
@@ -1549,11 +1560,16 @@
             if (!features || !features.chroma || !currentChord || correctChordLocked) return;
 
             // RMS check to ignore silence
-            if (features.rms < 0.005) {
+            if (features.rms < 0.003) {
                 return;
             }
 
             const inputChroma = features.chroma;
+
+            // 1. Temporal Smoothing (Exponential Moving Average)
+            for (let i = 0; i < 12; i++) {
+                previousChroma[i] = (previousChroma[i] * smoothingAlpha) + (inputChroma[i] * (1 - smoothingAlpha));
+            }
 
             // Build Target Chroma Template
             // Chroma is 12 bins: C, C#, D, D#, E, F, F#, G, G#, A, A#, B
@@ -1565,15 +1581,28 @@
                 targetChroma[noteIndex % 12] = 1;
             });
 
-            // Calculate Cosine Similarity
-            const similarity = calculateCosineSimilarity(inputChroma, targetChroma);
+            // Calculate Cosine Similarity on Smoothed Chroma
+            const similarity = calculateCosineSimilarity(previousChroma, targetChroma);
 
-            // Debug info
-            // console.log("Sim:", similarity.toFixed(2), "RMS:", features.rms.toFixed(4));
+            // 2. Dynamic Threshold based on Spectral Centroid
+            // Low centroid means bass-heavy signal. Bass signals often have messy harmonics.
+            // We lower the threshold slightly for bass signals.
+            let threshold = 0.88; // Default strict threshold
+
+            if (features.spectralCentroid) {
+                // spectralCentroid is in bins? Or Hz?
+                // Meyda docs: "The center of mass of the power spectrum". 
+                // With 8192 buffer, bin width is ~5-6Hz. 
+                // < 20 bins is < 120Hz approx.
+                if (features.spectralCentroid < 20) {
+                    threshold = 0.75; // More tolerant for deep bass
+                } else if (features.spectralCentroid < 40) {
+                    threshold = 0.82; // Mid-bass
+                }
+            }
 
             // Strict Threshold for correctness
-            // 0.85 is a good baseline for cosine similarity
-            if (similarity > 0.85) {
+            if (similarity > threshold) {
                 correctChordLocked = true;
                 triggerSuccess();
             }
